@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HistorAi - Пётр I</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero" aria-label="HistorAi">
+        <div>
+          <p class="kicker">RAG по письмам и бумагам Петра Великого</p>
+          <h1>Пётр I отвечает из документов</h1>
+          <p class="lead">
+            Задайте вопрос царю-реформатору. Ответ строится через выбранную LLM и
+            найденные отрывки из исторического корпуса.
+          </p>
+        </div>
+        <div class="crest" aria-hidden="true">
+          <span>I</span>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="Чат">
+        <aside class="panel">
+          <label for="modelSelect">Модель</label>
+          <select id="modelSelect">
+            {% for model in models %}
+              <option value="{{ model }}">{{ model|capitalize }}</option>
+            {% endfor %}
+          </select>
+
+          <button id="newChatButton" type="button">Новый диалог</button>
+
+          <div class="hint">
+            При смене модели история очищается, чтобы ответы разных моделей не
+            смешивались в одном разговоре.
+          </div>
+        </aside>
+
+        <div class="chat">
+          <div id="messages" class="messages" aria-live="polite">
+            <article class="message assistant">
+              <div class="message-role">Пётр I</div>
+              <p>
+                Спрашивай прямо. Коли в бумагах моих сыщется свидетельство,
+                приведу его кратко и по делу.
+              </p>
+            </article>
+          </div>
+
+          <form id="chatForm" class="composer">
+            <textarea
+              id="messageInput"
+              rows="2"
+              placeholder="Например: зачем ты строил флот?"
+              required
+            ></textarea>
+            <button type="submit">Отправить</button>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
