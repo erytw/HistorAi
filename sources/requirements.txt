@@ -1,0 +1,6 @@
+aiogram>=3.4
+flask>=3.0
+gigachat>=0.1.35
+python-dotenv>=1.0
+requests>=2.31
+scikit-learn>=1.4

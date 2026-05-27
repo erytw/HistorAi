@@ -23,13 +23,17 @@ function appendMessage(role, text, options = {}) {
     const details = document.createElement("details");
     details.className = "sources";
     const summary = document.createElement("summary");
-    summary.textContent = "Источники RAG";
+    summary.textContent = "Опора ответа";
     details.append(summary);
 
     options.sources.forEach((source, index) => {
       const sourceNode = document.createElement("div");
       sourceNode.className = "source";
-      sourceNode.textContent = `${index + 1}. ${source.text}`;
+      const title = document.createElement("strong");
+      title.textContent = `${index + 1}. ${source.source || "Источник"} · score ${source.score}`;
+      const body = document.createElement("span");
+      body.textContent = source.text;
+      sourceNode.append(title, body);
       details.append(sourceNode);
     });
 
@@ -46,7 +50,7 @@ function resetChat() {
   messages.innerHTML = "";
   appendMessage(
     "assistant",
-    "Диалог начат заново. Спрашивай прямо, а я сыщу нужное в бумагах."
+    "Диалог начат заново. Спрашивай прямо, и я отвечу, как ведаю сам."
   );
 }
 
@@ -81,6 +85,7 @@ form.addEventListener("submit", async (event) => {
   if (!text) return;
 
   input.value = "";
+  input.style.height = "";
   appendMessage("user", text);
 
   const button = form.querySelector("button");
@@ -99,7 +104,13 @@ modelSelect.addEventListener("change", resetChat);
 newChatButton.addEventListener("click", resetChat);
 
 input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
     form.requestSubmit();
   }
+});
+
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 112)}px`;
 });

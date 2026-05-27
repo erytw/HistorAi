@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import logging
 import os
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,31 @@ load_dotenv(BASE_DIR / ".env")
 logger = logging.getLogger(__name__)
 
 SUPPORTED_MODELS = ("gigachat", "deepseek")
+IGNORED_SOURCE_FILENAMES = {
+    "requirements.txt",
+}
+
+ANACHRONISM_PATTERNS = (
+    r"\b1[89]\d{2}\b",
+    r"\b20\d{2}\b",
+    r"\bxx\b",
+    r"\bxxi\b",
+    r"втор[а-яё]+\s+миров[а-яё]+",
+    r"перв[а-яё]+\s+миров[а-яё]+",
+    r"ссср",
+    r"советск",
+    r"ленин",
+    r"сталин",
+    r"гитлер",
+    r"наци",
+    r"фаши",
+    r"интернет",
+    r"компьютер",
+    r"телефон",
+    r"самолет",
+    r"атомн",
+    r"ядерн",
+)
 
 
 def _normalize_bool(value: str | bool | None, default: bool = False) -> bool:
@@ -43,6 +70,11 @@ def normalize_model(value: str | None) -> str:
             f"Unknown model '{value}'. Supported models: {', '.join(SUPPORTED_MODELS)}."
         )
     return model
+
+
+def is_obvious_anachronism(question: str) -> bool:
+    lowered = question.lower()
+    return any(re.search(pattern, lowered) for pattern in ANACHRONISM_PATTERNS)
 
 
 def get_gigachat_token(
@@ -85,6 +117,7 @@ def get_gigachat_token(
 class RetrievedChunk:
     text: str
     score: float
+    source: str = ""
 
 
 class DocumentRetriever:
@@ -92,7 +125,8 @@ class DocumentRetriever:
         self.documents_path = documents_path
         self.chunk_size = chunk_size
         self.top_k = top_k
-        self.chunks: List[str] = []
+        self.chunks: List[RetrievedChunk] = []
+        self.chunk_texts: List[str] = []
         self.vectorizer = TfidfVectorizer(
             analyzer="word",
             token_pattern=r"(?u)\b\w+\b",
@@ -115,30 +149,36 @@ class DocumentRetriever:
         else:
             txt_files = sorted(base_path.glob("*.txt"))
 
-        all_texts: List[str] = []
         for file_path in txt_files:
+            if file_path.name in IGNORED_SOURCE_FILENAMES:
+                logger.info("Skipped non-source text file: %s", file_path.name)
+                continue
             try:
-                text = file_path.read_text(encoding="utf-8-sig")
+                text = self._read_text_file(file_path)
                 text = re.sub(r"\s+", " ", text).strip()
                 if text:
-                    all_texts.append(text)
+                    self._create_chunks(text, file_path.name)
                     logger.info("Loaded document: %s", file_path.name)
             except Exception as exc:
                 logger.warning("Failed to read %s: %s", file_path, exc)
 
-        if not all_texts:
+        if not self.chunks:
             logger.warning("No text documents were loaded.")
             return
 
-        self._create_chunks(" ".join(all_texts))
+        self.chunk_texts = [chunk.text for chunk in self.chunks]
+        self.tfidf_matrix = self.vectorizer.fit_transform(self.chunk_texts)
+        logger.info("Created %s chunks and built TF-IDF matrix.", len(self.chunks))
 
-        if self.chunks:
-            self.tfidf_matrix = self.vectorizer.fit_transform(self.chunks)
-            logger.info("Created %s chunks and built TF-IDF matrix.", len(self.chunks))
-        else:
-            logger.warning("No chunks were created from the loaded documents.")
+    def _read_text_file(self, file_path: Path) -> str:
+        for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                return file_path.read_text(encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+        return file_path.read_text(encoding="utf-8", errors="ignore")
 
-    def _create_chunks(self, text: str) -> None:
+    def _create_chunks(self, text: str, source: str) -> None:
         paragraphs = re.split(r"(?<=[.!?])\s+", text)
         current_chunk = ""
 
@@ -151,11 +191,15 @@ class DocumentRetriever:
                 current_chunk = f"{current_chunk} {paragraph}".strip()
             else:
                 if current_chunk:
-                    self.chunks.append(current_chunk)
+                    self.chunks.append(
+                        RetrievedChunk(text=current_chunk, score=0.0, source=source)
+                    )
                 current_chunk = paragraph
 
         if current_chunk:
-            self.chunks.append(current_chunk)
+            self.chunks.append(
+                RetrievedChunk(text=current_chunk, score=0.0, source=source)
+            )
 
     def search(self, query: str) -> List[RetrievedChunk]:
         if not self.chunks or self.tfidf_matrix is None:
@@ -166,10 +210,21 @@ class DocumentRetriever:
         top_indices = similarities.argsort()[-self.top_k :][::-1]
 
         return [
-            RetrievedChunk(text=self.chunks[i], score=float(similarities[i]))
+            RetrievedChunk(
+                text=self.chunks[i].text,
+                score=float(similarities[i]),
+                source=self.chunks[i].source,
+            )
             for i in top_indices
             if similarities[i] > 0
         ]
+
+
+def _ensure_thread_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 class PeterTheGreatBotWithDocs:
@@ -197,14 +252,23 @@ class PeterTheGreatBotWithDocs:
         self.max_tokens = max_tokens
         self.verify_ssl_certs = verify_ssl_certs
         self.gigachat_client: GigaChat | None = None
+        self._gigachat_lock = threading.Lock()
 
         self.system_prompt = (
             "Ты — Пётр Первый, русский царь и император. Отвечай от первого лица. "
             "Держи стиль властным, прямым, деятельным, но не превращай речь в пародию. "
-            "Используй исторические документы из контекста как опору. "
-            "Если отвечаешь по документам, процитируй 1-2 коротких фрагмента в кавычках. "
-            "Если в найденных отрывках нет ответа, честно скажи, что в данных бумагах "
-            "прямого свидетельства не сыскалось, и отдели историческое предположение от факта."
+            "Ты живешь в своем времени и не знаешь событий после смерти Петра I "
+            "в 1725 году. Если вопрос касается будущего для тебя времени, поздних "
+            "войн, технологий, людей, стран или понятий, отвечай из роли: скажи, "
+            "что такого события, имени или дела тебе неведомо, и не объясняй его "
+            "современными знаниями. Не называй и не угадывай даты после 1725 года. "
+            "Сведения ниже — это твоя внутренняя память и опора для ответа, а не "
+            "внешние документы для обсуждения с собеседником. Никогда не говори "
+            "«в документах», «в бумагах», «в контексте», «в источниках», "
+            "«в отрывках» и не раскрывай RAG. Если сведений из памяти не хватает, "
+            "отвечай как Петр: «не ведаю», «мне о том не ведомо», «не слыхал о сем». "
+            "Короткие цитаты можно приводить только как собственные слова или "
+            "известную тебе речь, без упоминания источников."
         )
 
         self.retriever: DocumentRetriever | None = None
@@ -215,6 +279,7 @@ class PeterTheGreatBotWithDocs:
 
     def _init_model_client(self) -> None:
         if self.model == "gigachat":
+            _ensure_thread_event_loop()
             access_token = _env("GIGACHAT_ACCESS_TOKEN")
             client_id = _env("GIGACHAT_CLIENT_ID")
             client_secret = _env("GIGACHAT_CLIENT_SECRET")
@@ -252,16 +317,18 @@ class PeterTheGreatBotWithDocs:
         relevant = self._get_relevant_chunks(question)
         if not relevant:
             return (
-                "Подходящих отрывков не найдено. Отвечай только в общем "
-                "историческом стиле Петра I и не выдумывай цитаты.",
+                "Внутренняя память не дала точной опоры. Если вопрос вне времени "
+                "или знаний Петра I, ответь, что тебе это неведомо. Не используй "
+                "современные сведения и не упоминай внутреннюю память.",
                 [],
             )
 
         parts = [
-            "Вот отрывки из исторических документов, которые могут помочь с ответом:"
+            "Внутренняя память персонажа. Используй эти сведения молча: не называй "
+            "их документами, источниками, отрывками, контекстом или бумагами."
         ]
         for index, chunk in enumerate(relevant, start=1):
-            parts.append(f"Отрывок {index}:\n{chunk.text}")
+            parts.append(f"Память {index}:\n{chunk.text}")
 
         return "\n\n".join(parts), relevant
 
@@ -273,6 +340,8 @@ class PeterTheGreatBotWithDocs:
         question = question.strip()
         if not question:
             return None
+        if is_obvious_anachronism(question):
+            return self._anachronism_answer()
 
         context, _ = self.build_context(question)
         system_prompt = f"{self.system_prompt}\n\n{context}"
@@ -290,6 +359,13 @@ class PeterTheGreatBotWithDocs:
         question: str,
         history: Optional[Iterable[dict[str, str]]] = None,
     ) -> dict[str, object]:
+        if is_obvious_anachronism(question):
+            return {
+                "answer": self._anachronism_answer(),
+                "model": self.model,
+                "sources": [],
+            }
+
         context, sources = self.build_context(question)
         system_prompt = f"{self.system_prompt}\n\n{context}"
         messages = self._build_messages(system_prompt, question, history or [])
@@ -303,10 +379,21 @@ class PeterTheGreatBotWithDocs:
             "answer": answer,
             "model": self.model,
             "sources": [
-                {"text": source.text, "score": round(source.score, 4)}
+                {
+                    "text": source.text,
+                    "score": round(source.score, 4),
+                    "source": source.source,
+                }
                 for source in sources
             ],
         }
+
+    def _anachronism_answer(self) -> str:
+        return (
+            "Не ведаю о сем. Для меня такого дела, войны или имени нет: "
+            "я говорю о своем времени, о Русском государстве, войне со шведом, "
+            "флоте, ремеслах и государевом порядке. О грядущих веках судить не стану."
+        )
 
     def _build_messages(
         self,
@@ -327,6 +414,7 @@ class PeterTheGreatBotWithDocs:
         if self.gigachat_client is None:
             raise RuntimeError("GigaChat client is not initialized.")
 
+        _ensure_thread_event_loop()
         role_map = {
             "system": MessagesRole.SYSTEM,
             "user": MessagesRole.USER,
@@ -342,7 +430,9 @@ class PeterTheGreatBotWithDocs:
         )
 
         try:
-            response = self.gigachat_client.chat(chat)
+            with self._gigachat_lock:
+                _ensure_thread_event_loop()
+                response = self.gigachat_client.chat(chat)
             return response.choices[0].message.content
         except Exception as exc:
             logger.exception("GigaChat request failed: %s", exc)
@@ -350,7 +440,7 @@ class PeterTheGreatBotWithDocs:
 
     def _ask_deepseek(self, messages: List[dict[str, str]]) -> Optional[str]:
         payload = {
-            "model": _env("DEEPSEEK_MODEL", "deepseek-chat"),
+            "model": _env("DEEPSEEK_MODEL", "deepseek-v4-flash"),
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -377,6 +467,7 @@ class PeterTheGreatBotWithDocs:
     def close(self) -> None:
         if self.gigachat_client is not None:
             try:
+                _ensure_thread_event_loop()
                 self.gigachat_client.close()
             except Exception:
                 logger.debug("Failed to close GigaChat client cleanly.", exc_info=True)
@@ -394,7 +485,7 @@ class PeterTheGreatBotWithDocs:
 def create_bot_from_env(model: str | None = None) -> PeterTheGreatBotWithDocs:
     documents_path = _env(
         "DOCUMENTS_PATH",
-        "petr_veliky_pisma_i_bumagi_tom1_1688-1701_1887_text.txt",
+        "sources",
     )
     top_k = int(_env("TOP_K", "4"))
     chunk_size = int(_env("CHUNK_SIZE", "1200"))

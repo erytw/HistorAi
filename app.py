@@ -23,7 +23,11 @@ def get_bot(model: str):
 
 @app.get("/")
 def index():
-    return render_template("index.html", models=SUPPORTED_MODELS)
+    return render_template(
+        "index.html",
+        models=SUPPORTED_MODELS,
+        default_model=normalize_model(None),
+    )
 
 
 @app.get("/api/health")
